@@ -1,0 +1,143 @@
+name: CI/CD — Build, Push & Deploy
+
+# ─── Triggers ─────────────────────────────────────────────────────────────────
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:          # Allow manual runs from GitHub UI
+
+# ─── Environment variables shared across jobs ─────────────────────────────────
+env:
+  BACKEND_IMAGE:  ${{ secrets.DOCKERHUB_USERNAME }}/dd-task-backend
+  FRONTEND_IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/dd-task-frontend
+
+# ─────────────────────────────────────────────────────────────────────────────
+jobs:
+
+  # ══════════════════════════════════════════════════════════════════════════
+  #  JOB 1 — Build & push Docker images to Docker Hub
+  # ══════════════════════════════════════════════════════════════════════════
+  build-and-push:
+    name: Build & Push Docker Images
+    runs-on: ubuntu-latest
+
+    # Only push images on push to main/master (not on PRs)
+    if: github.event_name != 'pull_request'
+
+    outputs:
+      image_tag: ${{ steps.meta.outputs.short_sha }}
+
+    steps:
+      # 1. Checkout code
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 2. Compute short SHA tag (e.g. a1b2c3d) for immutable image tags
+      - name: Set image tag
+        id: meta
+        run: echo "short_sha=$(echo ${{ github.sha }} | cut -c1-7)" >> $GITHUB_OUTPUT
+
+      # 3. Set up Docker Buildx for multi-platform builds & better caching
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # 4. Log in to Docker Hub
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # 5. Build & push backend image
+      - name: Build & push backend
+        uses: docker/build-push-action@v5
+        with:
+          context: ./backend
+          file: ./backend/Dockerfile
+          push: true
+          tags: |
+            ${{ env.BACKEND_IMAGE }}:latest
+            ${{ env.BACKEND_IMAGE }}:${{ steps.meta.outputs.short_sha }}
+          cache-from: type=gha
+          cache-to:   type=gha,mode=max
+
+      # 6. Build & push frontend image
+      #    API_URL is proxied through Nginx, so it's always /api on the same host
+      - name: Build & push frontend
+        uses: docker/build-push-action@v5
+        with:
+          context: ./frontend
+          file: ./frontend/Dockerfile
+          push: true
+          build-args: |
+            API_URL=/api
+          tags: |
+            ${{ env.FRONTEND_IMAGE }}:latest
+            ${{ env.FRONTEND_IMAGE }}:${{ steps.meta.outputs.short_sha }}
+          cache-from: type=gha
+          cache-to:   type=gha,mode=max
+
+  # ══════════════════════════════════════════════════════════════════════════
+  #  JOB 2 — Deploy to VM via SSH
+  # ══════════════════════════════════════════════════════════════════════════
+  deploy:
+    name: Deploy to VM
+    runs-on: ubuntu-latest
+    needs: build-and-push
+
+    # Only deploy on push to main/master
+    if: github.event_name != 'pull_request'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # SSH into the VM, pull latest images, restart containers
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host:     ${{ secrets.VM_HOST }}
+          username: ${{ secrets.VM_USER }}
+          key:      ${{ secrets.VM_SSH_KEY }}
+          port:     ${{ secrets.VM_PORT || 22 }}
+          script: |
+            set -e
+
+            # ── 1. Ensure deploy directory exists ───────────────────────────
+            mkdir -p ~/dd-task-app
+            cd ~/dd-task-app
+
+            # ── 2. Pull latest docker-compose config from repo ──────────────
+            if [ ! -d .git ]; then
+              git clone ${{ github.server_url }}/${{ github.repository }} .
+            else
+              git fetch origin
+              git reset --hard origin/${{ github.ref_name }}
+            fi
+
+            # ── 3. Write .env file with credentials ─────────────────────────
+            cat > .env <<EOF
+            DOCKERHUB_USERNAME=${{ secrets.DOCKERHUB_USERNAME }}
+            IMAGE_TAG=latest
+            EOF
+
+            # ── 4. Log in to Docker Hub on VM ───────────────────────────────
+            echo "${{ secrets.DOCKERHUB_TOKEN }}" | \
+              docker login -u "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
+
+            # ── 5. Pull latest images ────────────────────────────────────────
+            docker compose pull
+
+            # ── 6. Restart all services (zero-downtime for unchanged services)
+            docker compose up -d --remove-orphans
+
+            # ── 7. Remove old/dangling images to free disk space ─────────────
+            docker image prune -f
+
+            # ── 8. Verify all containers are running ─────────────────────────
+            echo "=== Container status ==="
+            docker compose ps
+
+            echo "=== Deployment complete at $(date) ==="
